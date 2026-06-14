@@ -1,38 +1,56 @@
 // Package nasa is the library behind the nasa command line:
-// the HTTP client, request shaping, and the typed data models for nasa.
+// the HTTP client, request shaping, and the typed data models for NASA APIs.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
+// All endpoints require an API key; defaults to "DEMO_KEY" (30 req/hr).
+// Register a free key at api.nasa.gov for 1000 req/hr.
 package nasa
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to nasa. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "nasa/dev (+https://github.com/tamnd/nasa-cli)"
+// Config holds all tunable parameters for the NASA client.
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	APIKey    string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
+}
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at nasa.com; change it once you
-// know the real endpoints you want to read.
-const Host = "nasa.com"
+// DefaultConfig returns sensible defaults for the NASA API client.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://api.nasa.gov",
+		UserAgent: "nasa-cli/0.1.0 (github.com/tamnd/nasa-cli)",
+		APIKey:    "DEMO_KEY",
+		Rate:      200 * time.Millisecond,
+		Timeout:   30 * time.Second,
+		Retries:   3,
+	}
+}
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// Host is the primary domain this driver claims for URI routing.
+const Host = "api.nasa.gov"
 
-// Client talks to nasa over HTTP.
+// Client talks to the NASA API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	APIKey    string
+	cfg       Config
+
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,21 +58,169 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with DefaultConfig settings.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
+		UserAgent: cfg.UserAgent,
+		APIKey:    cfg.APIKey,
+		cfg:       cfg,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// APOD fetches the Astronomy Picture of the Day for a specific date (YYYY-MM-DD).
+// If date is empty, the API returns today's APOD.
+func (c *Client) APOD(ctx context.Context, date string) (*APOD, error) {
+	u := c.buildURL("/planetary/apod", "date", date)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var a APOD
+	if err := json.Unmarshal(body, &a); err != nil {
+		return nil, fmt.Errorf("apod decode: %w", err)
+	}
+	return &a, nil
+}
+
+// APODRange fetches a range of APODs between start and end (YYYY-MM-DD).
+func (c *Client) APODRange(ctx context.Context, start, end string) ([]APOD, error) {
+	u := c.buildURL("/planetary/apod", "start_date", start, "end_date", end)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var out []APOD
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("apod-range decode: %w", err)
+	}
+	return out, nil
+}
+
+// EPIC fetches the latest natural-color EPIC Earth images.
+func (c *Client) EPIC(ctx context.Context) ([]EPICImage, error) {
+	u := c.buildURL("/EPIC/api/natural")
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var raw []wireEPICImage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("epic decode: %w", err)
+	}
+	out := make([]EPICImage, len(raw))
+	for i, r := range raw {
+		out[i] = EPICImage{
+			Identifier: r.Identifier,
+			Caption:    r.Caption,
+			Date:       r.Date,
+			Lat:        r.CentroidCoordinates.Lat,
+			Lon:        r.CentroidCoordinates.Lon,
+			ImageURL:   epicImageURL(r.Date, r.Image),
+		}
+	}
+	return out, nil
+}
+
+// RoverPhotos fetches photos taken by a Mars rover on a specific Martian sol.
+// limit <= 0 returns all photos on that sol (up to one API page, ~25 by default).
+func (c *Client) RoverPhotos(ctx context.Context, rover string, sol, limit int) ([]RoverPhoto, error) {
+	if rover == "" {
+		rover = "curiosity"
+	}
+	u := c.buildURL(
+		"/mars-photos/api/v1/rovers/"+rover+"/photos",
+		"sol", fmt.Sprintf("%d", sol),
+		"page", "1",
+	)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var raw wireRoverResp
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("rover decode: %w", err)
+	}
+	out := make([]RoverPhoto, 0, len(raw.Photos))
+	for i, p := range raw.Photos {
+		if limit > 0 && i >= limit {
+			break
+		}
+		out = append(out, RoverPhoto{
+			ID:        p.ID,
+			Sol:       p.Sol,
+			Camera:    p.Camera.Name,
+			ImageURL:  p.ImgSrc,
+			EarthDate: p.EarthDate,
+			RoverName: p.Rover.Name,
+		})
+	}
+	return out, nil
+}
+
+// NEOFeed fetches near-Earth objects between start and end dates (YYYY-MM-DD).
+// The NASA API limits the window to 7 days.
+func (c *Client) NEOFeed(ctx context.Context, start, end string) ([]NEOSummary, error) {
+	u := c.buildURL("/neo/rest/v1/feed", "start_date", start, "end_date", end)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var raw wireNEOResp
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("neo decode: %w", err)
+	}
+
+	// Flatten the date-keyed map into a sorted slice.
+	var out []NEOSummary
+	for date, objects := range raw.NearEarthObjects {
+		for _, o := range objects {
+			out = append(out, NEOSummary{
+				Date:          date,
+				Name:          o.Name,
+				IsHazardous:   o.IsPotentiallyHazardousAsteroid,
+				DiameterMinKm: o.EstimatedDiameter.Kilometers.Min,
+				DiameterMaxKm: o.EstimatedDiameter.Kilometers.Max,
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Date != out[j].Date {
+			return out[i].Date < out[j].Date
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+// buildURL assembles a full request URL with api_key and optional key=value pairs.
+// Pairs with empty values are skipped.
+func (c *Client) buildURL(path string, params ...string) string {
+	apiKey := c.APIKey
+	if apiKey == "" {
+		apiKey = "DEMO_KEY"
+	}
+	sb := strings.Builder{}
+	sb.WriteString(c.cfg.BaseURL)
+	sb.WriteString(path)
+	sb.WriteString("?api_key=")
+	sb.WriteString(apiKey)
+	for i := 0; i+1 < len(params); i += 2 {
+		if params[i+1] != "" {
+			sb.WriteString("&")
+			sb.WriteString(params[i])
+			sb.WriteString("=")
+			sb.WriteString(params[i+1])
+		}
+	}
+	return sb.String()
+}
+
+// get fetches url with pacing and retries. The body is fully read and closed.
+func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -123,78 +289,95 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on nasa.com. It is a stand-in for the typed records you
-// will model from the real nasa endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `nasa cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// epicImageURL constructs the GSFC archive PNG URL for an EPIC image.
+// date format: "2024-01-15 00:37:48" → "2024/01/15"
+func epicImageURL(date, image string) string {
+	parts := strings.SplitN(date, " ", 2)
+	d := strings.ReplaceAll(parts[0], "-", "/")
+	return "https://epic.gsfc.nasa.gov/archive/natural/" + d + "/png/" + image + ".png"
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+// --- Public data types ---
+
+// APOD is the Astronomy Picture of the Day record.
+type APOD struct {
+	Date        string `json:"date"        kit:"id"`
+	Title       string `json:"title"`
+	Explanation string `json:"explanation,omitempty" kit:"body"`
+	MediaType   string `json:"media_type"`
+	URL         string `json:"url"`
+	HDURL       string `json:"hd_url,omitempty"`
+	Copyright   string `json:"copyright,omitempty"`
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
+// EPICImage is one Earth image from the DSCOVR EPIC camera.
+type EPICImage struct {
+	Identifier string  `json:"identifier"`
+	Caption    string  `json:"caption,omitempty"`
+	Date       string  `json:"date"`
+	Lat        float64 `json:"lat,omitempty"`
+	Lon        float64 `json:"lon,omitempty"`
+	ImageURL   string  `json:"image_url,omitempty"`
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+// RoverPhoto is one photo taken by a Mars rover.
+type RoverPhoto struct {
+	ID        int    `json:"id"`
+	Sol       int    `json:"sol"`
+	Camera    string `json:"camera"`
+	ImageURL  string `json:"image_url"`
+	EarthDate string `json:"earth_date"`
+	RoverName string `json:"rover"`
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
+// NEOSummary is a flattened record for one near-Earth object on one date.
+type NEOSummary struct {
+	Date          string  `json:"date"`
+	Name          string  `json:"name"`
+	IsHazardous   bool    `json:"is_potentially_hazardous"`
+	DiameterMinKm float64 `json:"diameter_min_km,omitempty"`
+	DiameterMaxKm float64 `json:"diameter_max_km,omitempty"`
+}
+
+// --- Wire types (internal, not exported) ---
+
+type wireRoverResp struct {
+	Photos []struct {
+		ID     int `json:"id"`
+		Sol    int `json:"sol"`
+		Camera struct {
+			Name     string `json:"name"`
+			FullName string `json:"full_name"`
+		} `json:"camera"`
+		ImgSrc    string `json:"img_src"`
+		EarthDate string `json:"earth_date"`
+		Rover     struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+		} `json:"rover"`
+	} `json:"photos"`
+}
+
+type wireEPICImage struct {
+	Identifier          string `json:"identifier"`
+	Caption             string `json:"caption"`
+	Date                string `json:"date"`
+	CentroidCoordinates struct {
+		Lat float64 `json:"lat"`
+		Lon float64 `json:"lon"`
+	} `json:"centroid_coordinates"`
+	Image string `json:"image"`
+}
+
+type wireNEOResp struct {
+	NearEarthObjects map[string][]struct {
+		Name                           string `json:"name"`
+		IsPotentiallyHazardousAsteroid bool   `json:"is_potentially_hazardous_asteroid"`
+		EstimatedDiameter              struct {
+			Kilometers struct {
+				Min float64 `json:"estimated_diameter_min"`
+				Max float64 `json:"estimated_diameter_max"`
+			} `json:"kilometers"`
+		} `json:"estimated_diameter"`
+	} `json:"near_earth_objects"`
 }

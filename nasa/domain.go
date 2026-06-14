@@ -2,6 +2,8 @@ package nasa
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -19,9 +21,6 @@ import (
 // nasa:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone nasa binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the nasa driver. It carries no state; the per-run client is
@@ -36,123 +35,242 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "nasa",
-			Short:  "A command line for nasa.",
-			Long: `A command line for nasa.
+			Short:  "A command line for NASA APIs.",
+			Long: `A command line for NASA Open APIs.
 
-nasa reads public nasa data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+nasa reads public NASA data — astronomy pictures, Earth imagery, Mars rover
+photos, and near-Earth objects — over plain HTTPS, shapes it into clean
+records, and prints output that pipes into the rest of your tools.
+
+A free API key (1000 req/hr) is available at https://api.nasa.gov.
+The default DEMO_KEY works at 30 req/hr.`,
+			Site: "api.nasa.gov",
 			Repo: "https://github.com/tamnd/nasa-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `nasa page` and
-	// `ant get nasa://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// apod: Astronomy Picture of the Day for a single date.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "apod",
+		Group:   "read",
+		Single:  true,
+		Summary: "Fetch Astronomy Picture of the Day",
+	}, getAPOD)
 
-	// List op: members of a page, the home of `nasa links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// nasa://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// apod-range: a range of APODs by date window.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "apod-range",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch a range of Astronomy Pictures of the Day",
+	}, getAPODRange)
+
+	// epic: latest EPIC Earth images from DSCOVR satellite.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "epic",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch latest EPIC Earth images",
+	}, getEPIC)
+
+	// rover: Mars rover photos for a given sol.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "rover",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch Mars rover photos",
+	}, getRoverPhotos)
+
+	// neo: near-Earth objects for a date range.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "neo",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch near-Earth objects summary",
+	}, getNEOFeed)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the Client from kit.Config, bridging APIKey from
+// the host-resolved config so --key propagates correctly.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	dcfg := DefaultConfig()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		dcfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		dcfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		dcfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		dcfg.Timeout = cfg.Timeout
+	}
+	c := &Client{
+		HTTP:      &http.Client{Timeout: dcfg.Timeout},
+		UserAgent: dcfg.UserAgent,
+		APIKey:    dcfg.APIKey,
+		cfg:       dcfg,
+		Rate:      dcfg.Rate,
+		Retries:   dcfg.Retries,
 	}
 	return c, nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type apodInput struct {
+	Date   string  `kit:"flag" help:"date YYYY-MM-DD (default: today)"`
+	Key    string  `kit:"flag" name:"key" help:"NASA API key (default: DEMO_KEY)"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type apodRangeInput struct {
+	Start  string  `kit:"flag" name:"start" help:"start date YYYY-MM-DD"`
+	End    string  `kit:"flag" name:"end" help:"end date YYYY-MM-DD"`
+	Key    string  `kit:"flag" name:"key" help:"NASA API key (default: DEMO_KEY)"`
+	Client *Client `kit:"inject"`
+}
+
+type epicInput struct {
+	Key    string  `kit:"flag" name:"key" help:"NASA API key (default: DEMO_KEY)"`
+	Client *Client `kit:"inject"`
+}
+
+type roverInput struct {
+	Name   string  `kit:"flag" name:"name" help:"rover name: curiosity, opportunity, spirit, perseverance"`
+	Sol    int     `kit:"flag" name:"sol" help:"Martian solar day"`
+	Limit  int     `kit:"flag,inherit" help:"max photos to return"`
+	Key    string  `kit:"flag" name:"key" help:"NASA API key (default: DEMO_KEY)"`
+	Client *Client `kit:"inject"`
+}
+
+type neoInput struct {
+	Start  string  `kit:"flag" name:"start" help:"start date YYYY-MM-DD"`
+	End    string  `kit:"flag" name:"end" help:"end date YYYY-MM-DD"`
+	Key    string  `kit:"flag" name:"key" help:"NASA API key (default: DEMO_KEY)"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func getAPOD(ctx context.Context, in apodInput, emit func(*APOD) error) error {
+	applyKey(in.Client, in.Key)
+	a, err := in.Client.APOD(ctx, in.Date)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
+	return emit(a)
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func getAPODRange(ctx context.Context, in apodRangeInput, emit func(*APOD) error) error {
+	if in.Start == "" || in.End == "" {
+		return errs.Usage("--start and --end are required")
+	}
+	applyKey(in.Client, in.Key)
+	items, err := in.Client.APODRange(ctx, in.Start, in.End)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+func getEPIC(ctx context.Context, in epicInput, emit func(*EPICImage) error) error {
+	applyKey(in.Client, in.Key)
+	images, err := in.Client.EPIC(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i := range images {
+		if err := emit(&images[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-// Classify turns any accepted input — a bare path or a full nasa.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+func getRoverPhotos(ctx context.Context, in roverInput, emit func(*RoverPhoto) error) error {
+	rover := in.Name
+	if rover == "" {
+		rover = "curiosity"
+	}
+	sol := in.Sol
+	if sol == 0 {
+		sol = 1000
+	}
+	applyKey(in.Client, in.Key)
+	photos, err := in.Client.RoverPhotos(ctx, rover, sol, in.Limit)
+	if err != nil {
+		return mapErr(fmt.Errorf("rover %s sol %d: %w", rover, sol, err))
+	}
+	for i := range photos {
+		if err := emit(&photos[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func getNEOFeed(ctx context.Context, in neoInput, emit func(*NEOSummary) error) error {
+	if in.Start == "" || in.End == "" {
+		return errs.Usage("--start and --end are required")
+	}
+	applyKey(in.Client, in.Key)
+	items, err := in.Client.NEOFeed(ctx, in.Start, in.End)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyKey updates the client's API key from the --key flag if provided.
+func applyKey(c *Client, key string) {
+	if key != "" {
+		c.APIKey = key
+		c.cfg.APIKey = key
+	}
+}
+
+// --- Resolver (URI driver) ---
+
+// Classify turns any accepted input — a bare date or a full api.nasa.gov URL —
+// into the canonical (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
+	id = nasaPath(input)
 	if id == "" {
 		return "", "", errs.Usage("unrecognized nasa reference: %q", input)
 	}
-	return "page", id, nil
+	return "apod", id, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "apod":
+		return "https://api.nasa.gov/planetary/apod?date=" + id, nil
+	default:
 		return "", errs.Usage("nasa has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
+func nasaPath(input string) string {
 	input = strings.TrimSpace(input)
 	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
 		return strings.Trim(u.Path, "/")
@@ -160,14 +278,6 @@ func pagePath(input string) string {
 	return strings.Trim(input, "/")
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
 func mapErr(err error) error {
 	return err
 }
